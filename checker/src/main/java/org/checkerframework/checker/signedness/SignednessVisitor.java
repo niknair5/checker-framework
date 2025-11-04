@@ -6,9 +6,12 @@ import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.UnaryTree;
+import java.util.List;
 import javax.lang.model.element.ExecutableElement;
 import org.checkerframework.checker.interning.InterningVisitor;
 import org.checkerframework.checker.interning.qual.EqualsMethod;
+import org.checkerframework.checker.signedness.qual.BitPattern;
 import org.checkerframework.checker.signedness.qual.PolySigned;
 import org.checkerframework.checker.signedness.qual.Signed;
 import org.checkerframework.checker.signedness.qual.Unsigned;
@@ -54,6 +57,16 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
   }
 
   /**
+   * Returns true if an annotated type is annotated as {@link BitPattern}
+   *
+   * @param type the annotated type to be checked
+   * @return true if the annotated type is annotated as {@link BitPattern}
+   */
+  private boolean hasBitPatternAnnotation(AnnotatedTypeMirror type) {
+    return type.hasPrimaryAnnotation(BitPattern.class);
+  }
+
+  /**
    * Enforces the following rules on binary operations involving Unsigned and Signed types:
    *
    * <ul>
@@ -82,7 +95,9 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
     switch (kind) {
       case DIVIDE:
       case REMAINDER:
-        if (hasUnsignedAnnotation(leftOpType)) {
+        if (hasBitPatternAnnotation(leftOpType) || hasBitPatternAnnotation(rightOpType)) {
+          checker.reportError(tree, "operation.bitpattern", kind, leftOpType, rightOpType);
+        } else if (hasUnsignedAnnotation(leftOpType)) {
           checker.reportError(leftOp, "operation.unsignedlhs", kind, leftOpType, rightOpType);
         } else if (hasUnsignedAnnotation(rightOpType)) {
           checker.reportError(rightOp, "operation.unsignedrhs", kind, leftOpType, rightOpType);
@@ -135,14 +150,30 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
 
       case PLUS:
         if (TreeUtils.isStringConcatenation(tree)) {
-          if (!typeHierarchy.isSubtypeShallowEffective(leftOpType, atypeFactory.SIGNED)) {
+          if (hasBitPatternAnnotation(leftOpType)) {
+            checker.reportError(leftOp, "bitpattern.concat");
+          } else if (hasBitPatternAnnotation(rightOpType)) {
+            checker.reportError(rightOp, "bitpattern.concat");
+          } else if (!typeHierarchy.isSubtypeShallowEffective(leftOpType, atypeFactory.SIGNED)) {
             checker.reportError(leftOp, "unsigned.concat");
           } else if (!typeHierarchy.isSubtypeShallowEffective(rightOpType, atypeFactory.SIGNED)) {
             checker.reportError(rightOp, "unsigned.concat");
           }
           break;
         }
-      // Other plus binary trees should be handled in the default case.
+        // Check for arithmetic operations on @BitPattern
+        if (hasBitPatternAnnotation(leftOpType) || hasBitPatternAnnotation(rightOpType)) {
+          checker.reportError(tree, "operation.bitpattern", kind, leftOpType, rightOpType);
+          break;
+        }
+      // fall through
+      case MINUS:
+      case MULTIPLY:
+        // Check for arithmetic operations on @BitPattern
+        if (hasBitPatternAnnotation(leftOpType) || hasBitPatternAnnotation(rightOpType)) {
+          checker.reportError(tree, "operation.bitpattern", kind, leftOpType, rightOpType);
+          break;
+        }
       // fall through
       default:
         if (leftOpType.hasPrimaryAnnotation(Unsigned.class)
@@ -173,43 +204,104 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
     super.processMethodTree(className, tree);
   }
 
+  /** Current method invocation being checked, for use in checkArguments. */
+  private MethodInvocationTree currentMethodInvocation = null;
+
+  @Override
+  protected void checkArguments(
+      List<? extends AnnotatedTypeMirror> requiredTypes,
+      List<? extends ExpressionTree> passedArgs,
+      CharSequence executableName,
+      List<?> paramNames) {
+    // Special handling for Double.longBitsToDouble and Float.intBitsToFloat
+    // Allow @BitPattern arguments even if stub file isn't loaded
+    if (currentMethodInvocation != null && passedArgs.size() == 1 && requiredTypes.size() == 1) {
+      ExecutableElement methElt = TreeUtils.elementFromUse(currentMethodInvocation);
+      if (methElt != null) {
+        String className = methElt.getEnclosingElement().toString();
+        String methodName = methElt.getSimpleName().toString();
+        if ((className.equals("java.lang.Double") && methodName.equals("longBitsToDouble"))
+            || (className.equals("java.lang.Float") && methodName.equals("intBitsToFloat"))) {
+          ExpressionTree arg = passedArgs.get(0);
+          AnnotatedTypeMirror argType = atypeFactory.getAnnotatedType(arg);
+          // Allow @BitPattern arguments for these methods
+          if (hasBitPatternAnnotation(argType)) {
+            // Skip the argument check for @BitPattern arguments
+            // Still scan the argument to check for other issues
+            scan(arg, null);
+            return;
+          }
+          // Also check if the argument is a bitwise operation with @BitPattern
+          // For example: masked | 1L where masked is @BitPattern
+          if (arg instanceof BinaryTree) {
+            BinaryTree binaryArg = (BinaryTree) arg;
+            Tree.Kind kind = binaryArg.getKind();
+            if (kind == Tree.Kind.OR || kind == Tree.Kind.AND || kind == Tree.Kind.XOR) {
+              AnnotatedTypeMirror leftType =
+                  atypeFactory.getAnnotatedType(binaryArg.getLeftOperand());
+              AnnotatedTypeMirror rightType =
+                  atypeFactory.getAnnotatedType(binaryArg.getRightOperand());
+              if (hasBitPatternAnnotation(leftType) || hasBitPatternAnnotation(rightType)) {
+                // This is a bitwise operation with @BitPattern, so allow it
+                scan(arg, null);
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // For all other cases, use the base implementation
+    super.checkArguments(requiredTypes, passedArgs, executableName, paramNames);
+  }
+
   @Override
   public Void visitMethodInvocation(MethodInvocationTree tree, Void p) {
     ExecutableElement methElt = TreeUtils.elementFromUse(tree);
-    boolean hasEqualsMethodAnno =
-        atypeFactory.getDeclAnnotation(methElt, EqualsMethod.class) != null;
-    if (hasEqualsMethodAnno || InterningVisitor.isInvocationOfEquals(tree)) {
-      int params = methElt.getParameters().size();
-      if (!(params == 1 || params == 2)) {
-        checker.reportError(
-            tree, "invalid.method.annotation", "@EqualsMethod", "1 or 2", methElt, params);
-      } else {
-        AnnotatedTypeMirror leftOpType;
-        AnnotatedTypeMirror rightOpType;
-        if (params == 1) {
-          leftOpType = atypeFactory.getReceiverType(tree);
-          rightOpType = atypeFactory.getAnnotatedType(tree.getArguments().get(0));
-        } else if (params == 2) {
-          leftOpType = atypeFactory.getAnnotatedType(tree.getArguments().get(0));
-          rightOpType = atypeFactory.getAnnotatedType(tree.getArguments().get(1));
-        } else {
-          throw new BugInCF("Checked that params is 1 or 2");
-        }
-        if (!atypeFactory.maybeIntegral(leftOpType) || !atypeFactory.maybeIntegral(rightOpType)) {
-          // nothing to do
-        } else if (leftOpType.hasPrimaryAnnotation(Unsigned.class)
-            && rightOpType.hasPrimaryAnnotation(Signed.class)) {
-          checker.reportError(tree, "comparison.mixed.unsignedlhs", leftOpType, rightOpType);
-        } else if (leftOpType.hasPrimaryAnnotation(Signed.class)
-            && rightOpType.hasPrimaryAnnotation(Unsigned.class)) {
-          checker.reportError(tree, "comparison.mixed.unsignedrhs", leftOpType, rightOpType);
-        }
-      }
-      // Don't check against the annotated method declaration (which super would do).
-      return null;
-    }
 
-    return super.visitMethodInvocation(tree, p);
+    // Set current method invocation for checkArguments to use
+    MethodInvocationTree prev = currentMethodInvocation;
+    currentMethodInvocation = tree;
+    try {
+      boolean hasEqualsMethodAnno =
+          atypeFactory.getDeclAnnotation(methElt, EqualsMethod.class) != null;
+      if (hasEqualsMethodAnno || InterningVisitor.isInvocationOfEquals(tree)) {
+        int params = methElt.getParameters().size();
+        if (!(params == 1 || params == 2)) {
+          checker.reportError(
+              tree, "invalid.method.annotation", "@EqualsMethod", "1 or 2", methElt, params);
+        } else {
+          AnnotatedTypeMirror leftOpType;
+          AnnotatedTypeMirror rightOpType;
+          if (params == 1) {
+            leftOpType = atypeFactory.getReceiverType(tree);
+            rightOpType = atypeFactory.getAnnotatedType(tree.getArguments().get(0));
+          } else if (params == 2) {
+            leftOpType = atypeFactory.getAnnotatedType(tree.getArguments().get(0));
+            rightOpType = atypeFactory.getAnnotatedType(tree.getArguments().get(1));
+          } else {
+            throw new BugInCF("Checked that params is 1 or 2");
+          }
+          if (!atypeFactory.maybeIntegral(leftOpType) || !atypeFactory.maybeIntegral(rightOpType)) {
+            // nothing to do
+          } else if (leftOpType.hasPrimaryAnnotation(Unsigned.class)
+              && rightOpType.hasPrimaryAnnotation(Signed.class)) {
+            checker.reportError(tree, "comparison.mixed.unsignedlhs", leftOpType, rightOpType);
+          } else if (leftOpType.hasPrimaryAnnotation(Signed.class)
+              && rightOpType.hasPrimaryAnnotation(Unsigned.class)) {
+            checker.reportError(tree, "comparison.mixed.unsignedrhs", leftOpType, rightOpType);
+          }
+        }
+        // Don't check against the annotated method declaration (which super would do).
+        return null;
+      }
+
+      Void result = super.visitMethodInvocation(tree, p);
+      return result;
+    } finally {
+      currentMethodInvocation = prev;
+    }
   }
 
   /**
@@ -256,7 +348,14 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
     switch (kind) {
       case DIVIDE_ASSIGNMENT:
       case REMAINDER_ASSIGNMENT:
-        if (hasUnsignedAnnotation(varType)) {
+        if (hasBitPatternAnnotation(varType) || hasBitPatternAnnotation(exprType)) {
+          checker.reportError(
+              tree,
+              "compound.assignment.bitpattern",
+              kindWithoutAssignment(kind),
+              varType,
+              exprType);
+        } else if (hasUnsignedAnnotation(varType)) {
           checker.reportError(
               var,
               "compound.assignment.unsigned.variable",
@@ -300,12 +399,37 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
 
       case PLUS_ASSIGNMENT:
         if (TreeUtils.isStringCompoundConcatenation(tree)) {
-          if (!typeHierarchy.isSubtypeShallowEffective(exprType, atypeFactory.SIGNED)) {
+          if (hasBitPatternAnnotation(varType)) {
+            checker.reportError(tree, "bitpattern.concat");
+            return null; // Return early to prevent base visitor from reporting
+          } else if (!typeHierarchy.isSubtypeShallowEffective(exprType, atypeFactory.SIGNED)) {
             checker.reportError(tree.getExpression(), "unsigned.concat");
           }
           break;
         }
-      // Other plus binary trees should be handled in the default case.
+        // Check for arithmetic operations on @BitPattern
+        if (hasBitPatternAnnotation(varType) || hasBitPatternAnnotation(exprType)) {
+          checker.reportError(
+              tree,
+              "compound.assignment.bitpattern",
+              kindWithoutAssignment(kind),
+              varType,
+              exprType);
+          return null; // Return early to prevent base visitor from reporting
+        }
+      // fall through
+      case MINUS_ASSIGNMENT:
+      case MULTIPLY_ASSIGNMENT:
+        // Check for arithmetic operations on @BitPattern
+        if (hasBitPatternAnnotation(varType) || hasBitPatternAnnotation(exprType)) {
+          checker.reportError(
+              tree,
+              "compound.assignment.bitpattern",
+              kindWithoutAssignment(kind),
+              varType,
+              exprType);
+          return null; // Return early to prevent base visitor from reporting
+        }
       // fall through
       default:
         if (varType.hasPrimaryAnnotation(Unsigned.class)
@@ -342,6 +466,23 @@ public class SignednessVisitor extends BaseTypeVisitor<SignednessAnnotatedTypeFa
   @Override
   protected AnnotationMirrorSet getExceptionParameterLowerBoundAnnotations() {
     return new AnnotationMirrorSet(atypeFactory.SIGNED);
+  }
+
+  @Override
+  public Void visitUnary(UnaryTree tree, Void p) {
+    Tree.Kind treeKind = tree.getKind();
+    if (treeKind == Tree.Kind.PREFIX_DECREMENT
+        || treeKind == Tree.Kind.PREFIX_INCREMENT
+        || treeKind == Tree.Kind.POSTFIX_DECREMENT
+        || treeKind == Tree.Kind.POSTFIX_INCREMENT) {
+      AnnotatedTypeMirror exprType = atypeFactory.getAnnotatedTypeLhs(tree.getExpression());
+      if (hasBitPatternAnnotation(exprType)) {
+        checker.reportError(tree, "unary.bitpattern");
+        // Return early to prevent base visitor from reporting generic assignment error
+        return null;
+      }
+    }
+    return super.visitUnary(tree, p);
   }
 
   @Override

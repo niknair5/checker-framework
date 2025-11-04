@@ -4,18 +4,25 @@ import com.sun.source.tree.BinaryTree;
 import com.sun.source.tree.CompoundAssignmentTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LiteralTree;
+import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TypeCastTree;
+import com.sun.source.tree.UnaryTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.io.Serializable;
+import java.lang.annotation.Annotation;
+import java.util.Collection;
 import java.util.List;
 import javax.annotation.processing.ProcessingEnvironment;
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.util.Elements;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.checkerframework.checker.signedness.qual.BitPattern;
 import org.checkerframework.checker.signedness.qual.PolySigned;
 import org.checkerframework.checker.signedness.qual.Signed;
 import org.checkerframework.checker.signedness.qual.SignedPositive;
@@ -35,11 +42,17 @@ import org.checkerframework.framework.type.AnnotatedTypeMirror;
 import org.checkerframework.framework.type.AnnotatedTypeMirror.AnnotatedDeclaredType;
 import org.checkerframework.framework.type.AnnotatedTypeMirror.AnnotatedExecutableType;
 import org.checkerframework.framework.type.AnnotatedTypeMirror.AnnotatedTypeVariable;
+import org.checkerframework.framework.type.ElementQualifierHierarchy;
+import org.checkerframework.framework.type.GenericAnnotatedTypeFactory;
+import org.checkerframework.framework.type.QualifierHierarchy;
 import org.checkerframework.framework.type.poly.DefaultQualifierPolymorphism;
 import org.checkerframework.framework.type.poly.QualifierPolymorphism;
 import org.checkerframework.framework.type.treeannotator.ListTreeAnnotator;
 import org.checkerframework.framework.type.treeannotator.PropagationTreeAnnotator;
 import org.checkerframework.framework.type.treeannotator.TreeAnnotator;
+import org.checkerframework.framework.util.DefaultQualifierKindHierarchy;
+import org.checkerframework.framework.util.QualifierKind;
+import org.checkerframework.framework.util.QualifierKindHierarchy;
 import org.checkerframework.javacutil.AnnotationBuilder;
 import org.checkerframework.javacutil.AnnotationMirrorSet;
 import org.checkerframework.javacutil.AnnotationUtils;
@@ -75,6 +88,10 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
   /** The @PolySigned annotation. */
   protected final AnnotationMirror POLY_SIGNED =
       AnnotationBuilder.fromClass(elements, PolySigned.class);
+
+  /** The @BitPattern annotation. */
+  protected final AnnotationMirror BIT_PATTERN =
+      AnnotationBuilder.fromClass(elements, BitPattern.class);
 
   /** The @NonNegative annotation of the Index Checker, as represented by the Value Checker. */
   private final AnnotationMirror INT_RANGE_FROM_NON_NEGATIVE =
@@ -260,6 +277,76 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
   }
 
   @Override
+  protected QualifierHierarchy createQualifierHierarchy() {
+    return new SignednessQualifierHierarchy(this.getSupportedTypeQualifiers(), elements, this);
+  }
+
+  /**
+   * Custom qualifier hierarchy that explicitly sets @SignednessBottom as the only bottom qualifier,
+   * preventing @BitPattern from being treated as a bottom.
+   *
+   * <p>This is necessary because the Checker Framework would otherwise treat @BitPattern as a
+   * bottom type since it's a qualifier without explicit bottom semantics. By explicitly setting
+   * SignednessBottom as the only bottom, we ensure @BitPattern is properly integrated into the type
+   * hierarchy.
+   */
+  private static class SignednessQualifierHierarchy extends ElementQualifierHierarchy {
+    /**
+     * Creates a SignednessQualifierHierarchy.
+     *
+     * @param qualifierClasses the qualifier classes
+     * @param elements the elements utility
+     * @param atypeFactory the annotated type factory
+     */
+    public SignednessQualifierHierarchy(
+        Collection<Class<? extends Annotation>> qualifierClasses,
+        Elements elements,
+        GenericAnnotatedTypeFactory<?, ?, ?, ?> atypeFactory) {
+      super(qualifierClasses, elements, atypeFactory);
+    }
+
+    @Override
+    protected QualifierKindHierarchy createQualifierKindHierarchy(
+        @org.checkerframework.checker.initialization.qual.UnderInitialization(
+                ElementQualifierHierarchy.class)
+            SignednessQualifierHierarchy this,
+        Collection<Class<? extends Annotation>> qualifierClasses) {
+      return new DefaultQualifierKindHierarchy(qualifierClasses, SignednessBottom.class);
+    }
+
+    @Override
+    public boolean isSubtypeQualifiers(AnnotationMirror subAnno, AnnotationMirror superAnno) {
+      QualifierKind subKind = getQualifierKind(subAnno);
+      QualifierKind superKind = getQualifierKind(superAnno);
+      return subKind.isSubtypeOf(superKind);
+    }
+
+    @Override
+    public @Nullable AnnotationMirror leastUpperBoundQualifiers(
+        AnnotationMirror a1, AnnotationMirror a2) {
+      QualifierKind qual1 = getQualifierKind(a1);
+      QualifierKind qual2 = getQualifierKind(a2);
+      QualifierKind lub = qualifierKindHierarchy.leastUpperBound(qual1, qual2);
+      if (lub == null) {
+        return null;
+      }
+      return kindToElementlessQualifier.get(lub);
+    }
+
+    @Override
+    public @Nullable AnnotationMirror greatestLowerBoundQualifiers(
+        AnnotationMirror a1, AnnotationMirror a2) {
+      QualifierKind qual1 = getQualifierKind(a1);
+      QualifierKind qual2 = getQualifierKind(a2);
+      QualifierKind glb = qualifierKindHierarchy.greatestLowerBound(qual1, qual2);
+      if (glb == null) {
+        return null;
+      }
+      return kindToElementlessQualifier.get(glb);
+    }
+  }
+
+  @Override
   protected TreeAnnotator createTreeAnnotator() {
     return new ListTreeAnnotator(new SignednessTreeAnnotator(this), super.createTreeAnnotator());
   }
@@ -282,12 +369,39 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
    *   <li>shift results take on the type of their left operand,
    *   <li>the types of identifiers are refined based on the results of the Value Checker.
    *   <li>casts take types related to widening
+   *   <li>bit pattern methods return @BitPattern types
+   *   <li>bitwise operations preserve @BitPattern types
    * </ul>
    */
   private class SignednessTreeAnnotator extends TreeAnnotator {
 
     public SignednessTreeAnnotator(AnnotatedTypeFactory atypeFactory) {
       super(atypeFactory);
+    }
+
+    @Override
+    public Void visitMethodInvocation(MethodInvocationTree tree, AnnotatedTypeMirror type) {
+      ExecutableElement methodElt = TreeUtils.elementFromUse(tree);
+      if (methodElt != null) {
+        String className = methodElt.getEnclosingElement().toString();
+        String methodName = methodElt.getSimpleName().toString();
+        int paramCount = methodElt.getParameters().size();
+
+        // Check for bit pattern methods: Double.doubleToLongBits, Double.doubleToRawLongBits,
+        // Float.floatToIntBits, Float.floatToRawIntBits
+        if (paramCount == 1) {
+          if (className.equals("java.lang.Double")) {
+            if (methodName.equals("doubleToLongBits") || methodName.equals("doubleToRawLongBits")) {
+              type.replaceAnnotation(BIT_PATTERN);
+            }
+          } else if (className.equals("java.lang.Float")) {
+            if (methodName.equals("floatToIntBits") || methodName.equals("floatToRawIntBits")) {
+              type.replaceAnnotation(BIT_PATTERN);
+            }
+          }
+        }
+      }
+      return super.visitMethodInvocation(tree, type);
     }
 
     @Override
@@ -306,10 +420,33 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
             type.replaceAnnotations(lht.getPrimaryAnnotations());
           }
           break;
+        case AND:
+        case OR:
+        case XOR:
+          // For bitwise operations, preserve @BitPattern if either operand is @BitPattern
+          AnnotatedTypeMirror leftType = getAnnotatedType(tree.getLeftOperand());
+          AnnotatedTypeMirror rightType = getAnnotatedType(tree.getRightOperand());
+          if (leftType.hasPrimaryAnnotation(BitPattern.class)
+              || rightType.hasPrimaryAnnotation(BitPattern.class)) {
+            type.replaceAnnotation(BIT_PATTERN);
+          }
+          break;
         default:
           // Do nothing
       }
       return null;
+    }
+
+    @Override
+    public Void visitUnary(UnaryTree tree, AnnotatedTypeMirror type) {
+      if (tree.getKind() == Tree.Kind.BITWISE_COMPLEMENT) {
+        // Bitwise complement preserves @BitPattern
+        AnnotatedTypeMirror exprType = getAnnotatedType(tree.getExpression());
+        if (exprType.hasPrimaryAnnotation(BitPattern.class)) {
+          type.replaceAnnotation(BIT_PATTERN);
+        }
+      }
+      return super.visitUnary(tree, type);
     }
 
     @Override
