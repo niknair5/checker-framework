@@ -1,0 +1,12 @@
+What worked well when using LLM support:
+
+1. Code generation and implementation: The LLM was very effective at generating boilerplate code and implementing the core structure of the @BitPattern annotation support, including creating the annotation class, updating the type factory, and modifying the visitor.
+
+2. Understanding the Checker Framework architecture: The LLM helped navigate the complex Checker Framework codebase, understanding how TreeAnnotators work, how visitors enforce rules, and how the type hierarchy system functions.
+
+3. Debugging and error fixing: The LLM was helpful in identifying and fixing compilation errors, understanding error messages, and resolving issues like the "multiple bottoms" error in the qualifier hierarchy.
+
+4. Documentation and code style: The LLM maintained consistency with the existing codebase style and generated appropriate JavaDoc comments following the project's conventions.
+
+5. Git operations: The LLM assisted with git commands, staging files, formatting with spotless, and creating appropriate commit messages.
+

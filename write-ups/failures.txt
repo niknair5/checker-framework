@@ -1,0 +1,12 @@
+What did not work well when using LLM support:
+
+1. Test failures and edge cases: The LLM struggled with resolving the final test failure (line 19 in BitPatternOperations.java) where a bitwise OR expression (masked | 1L) wasn't being properly recognized as @BitPattern. The multiple attempts to fix this through checkArguments override and other methods didn't fully resolve the issue.
+
+2. Stub file loading: The LLM initially had difficulty understanding how stub files are loaded and where they should be placed in the build system. It took several iterations to correctly place the jdk.astub file in the right location.
+
+3. Understanding build system nuances: The LLM sometimes missed subtle build system requirements (like spotless formatting, documentation requirements) that needed to be fixed through multiple iterations.
+
+4. Complex type system interactions: When dealing with complex interactions between the type annotator, visitor, and base framework classes, the LLM sometimes proposed solutions that didn't fully account for all the framework's mechanisms.
+
+5. Incremental debugging: The LLM had difficulty maintaining context across multiple debugging iterations, sometimes suggesting fixes that had already been tried or missing the root cause of issues.
+
